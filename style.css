@@ -139,3 +139,83 @@
 .kxf-btn-cancel:hover {
     background-color: rgba(231, 233, 234, 0.1);
 }
+/* --- Batch Processing UI --- */
+.kxf-cb-container {
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+}
+
+.kxf-checkbox {
+    width: 20px;
+    height: 20px;
+    cursor: pointer;
+    accent-color: rgb(244, 33, 46);
+}
+
+.kxf-batch-panel {
+    position: fixed;
+    bottom: 80px;
+    right: 20px;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    z-index: 9999;
+    min-width: 140px;
+}
+
+.kxf-batch-title {
+    color: #fff;
+    font-size: 13px;
+    font-weight: bold;
+    margin-bottom: 4px;
+    text-align: center;
+}
+
+.kxf-batch-btn {
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: none;
+    font-weight: bold;
+    cursor: pointer;
+    font-size: 12px;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.kxf-btn-primary { background: rgb(244, 33, 46); color: white; }
+.kxf-btn-primary:hover { background: rgb(220, 30, 41); }
+
+.kxf-btn-secondary { background: #333; color: white; }
+.kxf-btn-secondary:hover { background: #444; }
+
+.kxf-btn-stop { background: #666; color: white; }
+.kxf-btn-stop:hover { background: rgb(244, 33, 46); }
+
+.kxf-processing-highlight {
+    outline: 2px solid rgb(244, 33, 46) !important;
+    outline-offset: -2px;
+    background: rgba(244, 33, 46, 0.05) !important;
+}
+
+.kxf-hidden { display: none !important; }
+
+/* Selection all helper */
+.kxf-select-all-btn {
+    margin-bottom: 4px;
+    background: transparent;
+    color: #1d9bf0;
+    border: 1px solid #1d9bf0;
+}
+.kxf-select-all-btn:hover { background: rgba(29, 155, 240, 0.1); }

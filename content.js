@@ -1,6 +1,7 @@
 const isTopFrame = window.top === window.self;
 
 if (isTopFrame) {
+    console.log("🚀 [X 垃圾私信斩杀器] 已在主框架启动");
     console.log("[KXF] Top Frame Initialized.");
     
     // --- 1. Quick Jump Button ---
@@ -33,6 +34,14 @@ if (isTopFrame) {
     // MutationObserver to watch DOM for GrokDrawerHeader
     const topObserver = new MutationObserver((mutations) => {
         injectJumpButton();
+        
+        const isRequestPage = window.location.href.includes('/requests');
+        if (isRequestPage) {
+            injectCheckboxes();
+            injectBatchPanel();
+        } else {
+            removeBatchPanel();
+        }
         
         // Also watch for Report menu when auto-report is active
         if (sessionStorage.getItem("kxf_auto_report") === "true") {
@@ -87,19 +96,32 @@ if (isTopFrame) {
             showKillPrompt();
         } else if (event.data.type === "KXF_KILL_DONE") {
             console.log("[KXF] Action complete inside iframe. Cleaning up...");
-            // Force hide the iframe to ensure it doesn't block clicks on the "Done" button
+            
+            // Validate if this message belongs to the current batch item
+            if (window.BatchRunner && window.BatchRunner.state === 'RUNNING') {
+                if (event.data.batchId && event.data.batchId !== window.BatchRunner.currentBatchId) {
+                    console.log("[KXF] Ignoring stale KILL_DONE message from old batch item.");
+                    return;
+                }
+            }
+
+            // Force hide and remove all report iframes
             const iframes = document.querySelectorAll('iframe[src*="report_story"]');
             iframes.forEach(iframe => {
                 iframe.style.pointerEvents = 'none';
                 iframe.style.opacity = '0';
-                // Don't remove immediately just in case X's internal state depends on it, but hide it
-                setTimeout(() => { try { iframe.remove(); } catch(e){} }, 2000); 
+                setTimeout(() => { try { iframe.remove(); } catch(e){} }, 500); 
             });
             tryCloseModal();
         } else if (event.data.type === "KXF_IS_ARMED_QUERY") {
             const isArmed = sessionStorage.getItem("kxf_auto_report") === "true";
+            const batchId = window.BatchRunner ? window.BatchRunner.currentBatchId : null;
             if (event.source) {
-                event.source.postMessage({ type: "KXF_IS_ARMED_RESPONSE", armed: isArmed }, "*");
+                event.source.postMessage({ 
+                    type: "KXF_IS_ARMED_RESPONSE", 
+                    armed: isArmed,
+                    batchId: batchId 
+                }, "*");
             }
         }
     });
@@ -168,6 +190,17 @@ if (isTopFrame) {
                 } else {
                     console.log("[KXF] Success: Modal is gone.");
                     sessionStorage.removeItem("kxf_auto_report");
+                    
+                    // If batching, move to next after cooling down
+                    if (window.BatchRunner && window.BatchRunner.state === 'RUNNING') {
+                        window.BatchRunner.statusText = "清理环境中...";
+                        window.BatchRunner.updateUI();
+                        
+                        setTimeout(() => {
+                            window.BatchRunner.isLocked = false;
+                            window.BatchRunner.processNext();
+                        }, 2500); // 2.5s mandatory cooldown for React/X state sync
+                    }
                 }
             }, 300); // Fast interval
         };
@@ -252,7 +285,10 @@ if (isTopFrame) {
             // Broadcast to all iframes
             const iframes = document.querySelectorAll('iframe');
             iframes.forEach(iframe => {
-                iframe.contentWindow.postMessage({ type: "KXF_DO_KILL" }, "*");
+                iframe.contentWindow.postMessage({ 
+                    type: "KXF_DO_KILL",
+                    batchId: window.BatchRunner ? window.BatchRunner.currentBatchId : null
+                }, "*");
             });
             setTimeout(() => {
                 overlay.remove();
@@ -261,39 +297,281 @@ if (isTopFrame) {
 
         const timer = setInterval(() => {
             countdown--;
+            if (window.BatchRunner) window.BatchRunner.countDown = countdown;
+            if (window.BatchRunner) window.BatchRunner.updateUI();
+
             if (countdown > 0) {
                 killBtn.textContent = `报蔽之 (${countdown}s)`;
             } else {
                 clearInterval(timer);
+                if (window.BatchRunner) delete window.BatchRunner.countDown;
                 doKill();
             }
         }, 1000);
 
         cancelBtn.addEventListener('click', () => {
             clearInterval(timer);
+            if (window.BatchRunner) delete window.BatchRunner.countDown;
             overlay.remove();
             tryCloseModal();
         });
 
         killBtn.addEventListener('click', () => {
             clearInterval(timer);
+            if (window.BatchRunner) delete window.BatchRunner.countDown;
             doKill();
         });
     }
 
+    // --- 4. Batch Processing Implementation ---
+
+    window.BatchRunner = {
+        state: 'IDLE', // IDLE, RUNNING, PAUSED
+        isLocked: false,
+        currentBatchId: null,
+        countDown: undefined,
+        statusText: "",
+
+        start() {
+            const checked = Array.from(document.querySelectorAll('.kxf-checkbox:checked'));
+            if (checked.length === 0) {
+                alert("请先勾选需要斩杀的用户！");
+                return;
+            }
+            this.state = 'RUNNING';
+            this.isLocked = false;
+            this.updateUI();
+            this.processNext();
+        },
+
+        pause() {
+            this.state = 'PAUSED';
+            this.updateUI();
+        },
+
+        resume() {
+            this.state = 'RUNNING';
+            this.updateUI();
+            this.processNext();
+        },
+
+        stop() {
+            this.state = 'IDLE';
+            this.isLocked = false;
+            this.currentBatchId = null;
+            this.updateUI();
+            const checked = document.querySelectorAll('.kxf-checkbox:checked');
+            checked.forEach(cb => cb.checked = false);
+            document.querySelectorAll('.kxf-processing-highlight').forEach(el => el.classList.remove('kxf-processing-highlight'));
+        },
+
+        processNext() {
+            if (this.state !== 'RUNNING' || this.isLocked) return;
+
+            // Find next checked but not yet processed (highlighted) checkbox
+            const checked = Array.from(document.querySelectorAll('.kxf-checkbox:checked'));
+            const nextCb = checked.find(cb => !cb.dataset.kxfProcessed);
+
+            if (!nextCb) {
+                console.log("[KXF] Batch complete!");
+                this.stop();
+                alert("批量斩杀完成！");
+                return;
+            }
+
+            this.isLocked = true;
+            this.currentBatchId = Date.now();
+            this.statusText = "寻找目标...";
+            this.updateUI();
+
+            const container = nextCb.closest('[data-testid="cellInnerDiv"]');
+            if (container) {
+                // Highlight and scroll
+                document.querySelectorAll('.kxf-processing-highlight').forEach(el => el.classList.remove('kxf-processing-highlight'));
+                container.classList.add('kxf-processing-highlight');
+                container.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+                // Find the options button and trigger
+                const optBtn = container.querySelector(`button[aria-label="选项菜单"]`);
+                if (optBtn) {
+                    console.log("[KXF] Batch: Starting next kill with ID:", this.currentBatchId);
+                    nextCb.dataset.kxfProcessed = "true";
+                    
+                    // Trigger the existing click logic
+                    sessionStorage.setItem("kxf_auto_report", "true");
+                    document.querySelectorAll('[data-kxf-clicked]').forEach(el => delete el.dataset.kxfClicked);
+                    
+                    // Small delay to ensure scroll finished
+                    setTimeout(() => {
+                        this.statusText = "触发举报菜单...";
+                        this.updateUI();
+                        robustClickTop(optBtn);
+                    }, 1000);
+                } else {
+                    console.warn("[KXF] Could not find options button for item, skipping.");
+                    nextCb.dataset.kxfProcessed = "true";
+                    this.isLocked = false;
+                    this.processNext();
+                }
+            }
+        },
+
+        updateUI() {
+            const panel = document.getElementById('kxf-batch-panel');
+            if (!panel) return;
+
+            const startBtn = panel.querySelector('.kxf-btn-start');
+            const pauseBtn = panel.querySelector('.kxf-btn-pause');
+            const stopBtn = panel.querySelector('.kxf-btn-stop');
+            const progressContainer = panel.querySelector('.kxf-progress-container');
+
+            if (this.state === 'IDLE') {
+                startBtn.classList.remove('kxf-hidden');
+                pauseBtn.classList.add('kxf-hidden');
+                stopBtn.classList.add('kxf-hidden');
+                progressContainer.classList.add('kxf-hidden');
+            } else {
+                startBtn.classList.add('kxf-hidden');
+                pauseBtn.classList.remove('kxf-hidden');
+                stopBtn.classList.remove('kxf-hidden');
+                progressContainer.classList.remove('kxf-hidden');
+                pauseBtn.textContent = this.state === 'RUNNING' ? '暂停' : '继续';
+
+                // Update Progress Data
+                const allChecked = Array.from(document.querySelectorAll('.kxf-checkbox:checked'));
+                const processed = allChecked.filter(cb => cb.dataset.kxfProcessed === "true").length;
+                const total = allChecked.length;
+                const percent = Math.round((processed / total) * 100);
+
+                const countEl = panel.querySelector('.kxf-progress-count');
+                const barEl = panel.querySelector('.kxf-progress-bar-fill');
+                
+                // Show countdown or status if active
+                if (this.countDown !== undefined) {
+                    countEl.innerHTML = `<span style="color:rgb(244,33,46); font-weight:bold;">斩杀中: ${this.countDown}s</span> | ${processed} / ${total}`;
+                } else if (this.statusText) {
+                    countEl.innerHTML = `<span style="color:#1d9bf0;">${this.statusText}</span> | ${processed} / ${total}`;
+                } else {
+                    countEl.textContent = `${processed} / ${total}`;
+                }
+                
+                barEl.style.width = `${percent}%`;
+            }
+        }
+    };
+
+    function injectCheckboxes() {
+        const cells = document.querySelectorAll('div[data-testid="cellInnerDiv"]');
+        cells.forEach(cell => {
+            const conv = cell.querySelector('div[data-testid="conversation"]');
+            if (!conv || cell.querySelector('.kxf-cb-container')) return;
+
+            // CRITICAL: Do NOT set cell.style.position = 'relative'. 
+            // X uses absolute positioning for its virtual scroll. Overriding it breaks row heights.
+
+            const cbContainer = document.createElement('div');
+            cbContainer.className = 'kxf-cb-container';
+            // Use absolute positioning inside the conv container and add padding to make space
+            conv.style.position = 'relative';
+            conv.style.paddingLeft = '42px'; 
+            
+            cbContainer.style.cssText = "position: absolute; left: 10px; top: 50%; transform: translateY(-50%); z-index: 101; display: flex; align-items: center; justify-content: center; width: 20px; height: 20px;";
+            cbContainer.innerHTML = `<input type="checkbox" class="kxf-checkbox" style="width: 20px; height: 20px; cursor: pointer; accent-color: rgb(244,33,46);">`;
+            
+            conv.insertBefore(cbContainer, conv.firstChild);
+            
+            const checkbox = cbContainer.querySelector('input');
+            const stop = (e) => e.stopPropagation();
+            cbContainer.addEventListener('click', stop);
+            cbContainer.addEventListener('mousedown', stop);
+            cbContainer.addEventListener('mouseup', stop);
+
+            checkbox.addEventListener('change', () => {
+                if (checkbox.checked) {
+                    cell.style.backgroundColor = 'rgba(244, 33, 46, 0.1)';
+                    delete checkbox.dataset.kxfProcessed;
+                } else {
+                    cell.style.backgroundColor = '';
+                }
+            });
+        });
+    }
+    
+    // Fallback: X's React is aggressive, re-check every second on request page
+    setInterval(() => {
+        if (window.location.href.includes('/requests')) {
+            injectCheckboxes();
+        }
+    }, 1000);
+
+    function injectBatchPanel() {
+        if (document.getElementById('kxf-batch-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'kxf-batch-panel';
+        panel.className = 'kxf-batch-panel';
+        panel.innerHTML = `
+            <div class="kxf-batch-title">批量斩杀控制</div>
+            <button class="kxf-batch-btn kxf-select-all-btn">全选/取消</button>
+            <button class="kxf-batch-btn kxf-btn-primary kxf-btn-start">🚀 开始批量斩杀</button>
+            <button class="kxf-batch-btn kxf-btn-secondary kxf-btn-pause kxf-hidden">暂停</button>
+            <button class="kxf-batch-btn kxf-btn-stop kxf-hidden">停止</button>
+            
+            <div class="kxf-progress-container kxf-hidden">
+                <div class="kxf-progress-text">
+                    <span>进度</span>
+                    <span class="kxf-progress-count">0 / 0</span>
+                </div>
+                <div class="kxf-progress-bar-bg">
+                    <div class="kxf-progress-bar-fill"></div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        panel.querySelector('.kxf-select-all-btn').addEventListener('click', () => {
+            const boxes = document.querySelectorAll('.kxf-checkbox');
+            const anyUnchecked = Array.from(boxes).some(b => !b.checked);
+            boxes.forEach(b => {
+                b.checked = anyUnchecked;
+                delete b.dataset.kxfProcessed;
+                // Trigger visual update
+                const container = b.closest('[data-testid="cellInnerDiv"]');
+                if (container) container.style.backgroundColor = b.checked ? 'rgba(244, 33, 46, 0.1)' : '';
+            });
+        });
+
+        panel.querySelector('.kxf-btn-start').addEventListener('click', () => window.BatchRunner.start());
+        
+        panel.querySelector('.kxf-btn-pause').addEventListener('click', () => {
+            if (window.BatchRunner.state === 'RUNNING') window.BatchRunner.pause();
+            else window.BatchRunner.resume();
+        });
+
+        panel.querySelector('.kxf-btn-stop').addEventListener('click', () => window.BatchRunner.stop());
+    }
+
+    function removeBatchPanel() {
+        const panel = document.getElementById('kxf-batch-panel');
+        if (panel) panel.remove();
+    }
+
 } else {
-    // --- IFRAME CONTEXT (\`https://x.com/i/safety/report_story\`) ---
+    // --- IFRAME CONTEXT (`https://x.com/i/safety/report_story`) ---
     
     if (window.location.href.includes('report_story')) {
         console.log("[KXF] Iframe Initialized.");
         
         let autoReportArmed = false;
+        let currentBatchId = null;
 
         // Trust parent window's answer if we get one
         window.addEventListener("message", (event) => {
             if (event.data && event.data.type === "KXF_IS_ARMED_RESPONSE") {
                 autoReportArmed = event.data.armed;
-                console.log("[KXF Iframe] Armed Status from Parent:", autoReportArmed);
+                currentBatchId = event.data.batchId;
+                console.log("[KXF Iframe] Armed Status from Parent:", autoReportArmed, "Batch ID:", currentBatchId);
                 if (autoReportArmed) {
                     processIframeFlow(); // Trigger immediately!
                 }
@@ -303,15 +581,8 @@ if (isTopFrame) {
                     console.log("[KXF Iframe] Kill Order received. Blocking!");
                     robustClick(blockBtn);
                     
-                    // Send message immediately AND after a delay to counter X's aggressive redirection
-                    // which kills the setTimeout. The top frame's tryCloseModal handles the rest.
-                    window.parent.postMessage({ type: "KXF_KILL_DONE" }, "*");
-                    
-                    setTimeout(() => {
-                        try {
-                            window.parent.postMessage({ type: "KXF_KILL_DONE" }, "*");
-                        } catch(e) {}
-                    }, 200);
+                    // Send message immediately with Batch ID
+                    window.parent.postMessage({ type: "KXF_KILL_DONE", batchId: event.data.batchId || currentBatchId }, "*");
                 }
             }
         });
