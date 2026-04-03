@@ -3,6 +3,7 @@ const isTopFrame = window.top === window.self;
 if (isTopFrame) {
     console.log("🚀 [X 垃圾私信斩杀器] 已在主框架启动");
     console.log("[KXF] Top Frame Initialized.");
+    window.lastProcessedBatchId = null;
     
     // --- 1. Quick Jump Button ---
     const JUMP_URL = "https://x.com/messages/requests";
@@ -31,17 +32,60 @@ if (isTopFrame) {
         document.body.appendChild(btn);
     }
     
-    // MutationObserver to watch DOM for GrokDrawerHeader
-    const topObserver = new MutationObserver((mutations) => {
-        injectJumpButton();
-        
-        const isRequestPage = window.location.href.includes('/requests');
-        if (isRequestPage) {
-            injectCheckboxes();
-            injectBatchPanel();
-        } else {
-            removeBatchPanel();
+    // --- 1. Settings & UI Management ---
+    async function applySettings() {
+        try {
+            // Check if context is still valid
+            if (!chrome.runtime?.id) {
+                console.log("[KXF] Extension context invalidated. Stopping operations.");
+                return;
+            }
+
+            const data = await chrome.storage.local.get(['enabled', 'batchEnabled']);
+            
+            if (data.enabled === false) {
+                const btn = document.querySelector('.kxf-jump-btn');
+                if (btn) btn.remove();
+                removeBatchPanel();
+                removeCheckboxes();
+                return;
+            }
+
+            injectJumpButton();
+            
+            const isRequestPage = window.location.href.includes('/requests');
+            if (isRequestPage && data.batchEnabled) {
+                document.body.classList.add('kxf-batch-mode');
+                injectCheckboxes();
+                injectBatchPanel();
+            } else {
+                document.body.classList.remove('kxf-batch-mode');
+                removeBatchPanel();
+                removeCheckboxes();
+            }
+        } catch (e) {
+            if (e.message.includes('context invalidated')) {
+                // Silent stop
+                return;
+            }
+            console.error("[KXF] applySettings error:", e);
         }
+    }
+
+    // Listen for setting changes from popup
+    chrome.storage.onChanged.addListener((changes) => {
+        if (changes.enabled || changes.batchEnabled) {
+            console.log("[KXF] Settings changed, applying...");
+            applySettings();
+        }
+    });
+
+    // Initial apply
+    applySettings();
+
+    // MutationObserver to watch DOM for changes
+    const topObserver = new MutationObserver(async (mutations) => {
+        applySettings();
         
         // Also watch for Report menu when auto-report is active
         if (sessionStorage.getItem("kxf_auto_report") === "true") {
@@ -80,6 +124,18 @@ if (isTopFrame) {
             console.log("[KXF] Delete icon clicked. Arming Auto-Report!");
             sessionStorage.setItem("kxf_auto_report", "true");
             
+            // Extract handle for logging
+            const container = e.target.closest('[data-testid="cellInnerDiv"]');
+            if (container && window.BatchRunner) {
+                const handleEl = container.querySelector('a[data-testid="DM_Conversation_Avatar"]') || 
+                                 container.querySelector('a[href^="/"]');
+                if (handleEl) {
+                    const href = handleEl.getAttribute('href');
+                    window.BatchRunner.currentTargetHandle = href.split('/').filter(p => p).shift();
+                    console.log("[KXF] Manual target handle extracted:", window.BatchRunner.currentTargetHandle);
+                }
+            }
+
             // Critical: Reset all click markers on existing elements so we can trigger again
             // X often reuses menu elements and buttons; if we don't clear these, 
             // the second run will "think" it already clicked the button.
@@ -97,13 +153,13 @@ if (isTopFrame) {
         } else if (event.data.type === "KXF_KILL_DONE") {
             console.log("[KXF] Action complete inside iframe. Cleaning up...");
             
-            // Validate if this message belongs to the current batch item
-            if (window.BatchRunner && window.BatchRunner.state === 'RUNNING') {
-                if (event.data.batchId && event.data.batchId !== window.BatchRunner.currentBatchId) {
-                    console.log("[KXF] Ignoring stale KILL_DONE message from old batch item.");
-                    return;
-                }
+            // Deduplicate: Don't process the same batch item twice
+            const msgBatchId = event.data.batchId || (window.BatchRunner ? window.BatchRunner.currentBatchId : null);
+            if (msgBatchId && window.lastProcessedBatchId === msgBatchId) {
+                console.log("[KXF] Already processed this batch item. Ignoring duplicate.");
+                return;
             }
+            window.lastProcessedBatchId = msgBatchId;
 
             // Force hide and remove all report iframes
             const iframes = document.querySelectorAll('iframe[src*="report_story"]');
@@ -112,6 +168,11 @@ if (isTopFrame) {
                 iframe.style.opacity = '0';
                 setTimeout(() => { try { iframe.remove(); } catch(e){} }, 500); 
             });
+
+            // LOGGING: Record the ban
+            const handle = window.BatchRunner ? window.BatchRunner.currentTargetHandle : "未知用户";
+            recordBan(handle);
+
             tryCloseModal();
         } else if (event.data.type === "KXF_IS_ARMED_QUERY") {
             const isArmed = sessionStorage.getItem("kxf_auto_report") === "true";
@@ -256,6 +317,33 @@ if (isTopFrame) {
         }
     }
 
+    // Storage Helper for Logging
+    async function recordBan(handle) {
+        try {
+            if (!chrome.runtime?.id) return;
+
+            console.log(`[KXF] Recording ban for: ${handle}`);
+            const data = await chrome.storage.local.get(['banCount', 'banLogs']);
+            const newCount = (data.banCount || 0) + 1;
+            const newLogs = data.banLogs || [];
+            
+            newLogs.push({
+                handle: handle.startsWith('@') ? handle : `@${handle}`,
+                timestamp: Date.now()
+            });
+            
+            // Keep only last 200 logs
+            if (newLogs.length > 200) newLogs.shift();
+            
+            await chrome.storage.local.set({ 
+                banCount: newCount, 
+                banLogs: newLogs 
+            });
+        } catch (e) {
+            console.error("[KXF] recordBan error:", e);
+        }
+    }
+
     function showKillPrompt() {
         if (document.getElementById('kxf-overlay')) return;
 
@@ -328,17 +416,21 @@ if (isTopFrame) {
     window.BatchRunner = {
         state: 'IDLE', // IDLE, RUNNING, PAUSED
         isLocked: false,
-        currentBatchId: null,
+        totalTasks: 0,
         countDown: undefined,
         statusText: "",
+        currentTargetHandle: null,
+        selectedHandles: new Set(),
+        taskQueue: [],
 
         start() {
-            const checked = Array.from(document.querySelectorAll('.kxf-checkbox:checked'));
-            if (checked.length === 0) {
+            if (this.selectedHandles.size === 0) {
                 alert("请先勾选需要斩杀的用户！");
                 return;
             }
             this.state = 'RUNNING';
+            this.taskQueue = Array.from(this.selectedHandles);
+            this.totalTasks = this.taskQueue.length;
             this.isLocked = false;
             this.updateUI();
             this.processNext();
@@ -359,32 +451,52 @@ if (isTopFrame) {
             this.state = 'IDLE';
             this.isLocked = false;
             this.currentBatchId = null;
+            this.taskQueue = [];
+            this.selectedHandles.clear();
             this.updateUI();
-            const checked = document.querySelectorAll('.kxf-checkbox:checked');
-            checked.forEach(cb => cb.checked = false);
+            
+            // Clear all checkboxes in DOM
+            document.querySelectorAll('.kxf-checkbox').forEach(cb => cb.checked = false);
             document.querySelectorAll('.kxf-processing-highlight').forEach(el => el.classList.remove('kxf-processing-highlight'));
+            document.querySelectorAll('div[data-testid="cellInnerDiv"]').forEach(cell => cell.style.backgroundColor = '');
         },
 
         processNext() {
             if (this.state !== 'RUNNING' || this.isLocked) return;
 
-            // Find next checked but not yet processed (highlighted) checkbox
-            const checked = Array.from(document.querySelectorAll('.kxf-checkbox:checked'));
-            const nextCb = checked.find(cb => !cb.dataset.kxfProcessed);
-
-            if (!nextCb) {
+            if (this.taskQueue.length === 0) {
                 console.log("[KXF] Batch complete!");
                 this.stop();
                 alert("批量斩杀完成！");
                 return;
             }
 
+            const nextHandle = this.taskQueue.shift();
+            this.currentTargetHandle = nextHandle;
+            
+            // Try to find the row for this handle in the DOM
+            const cells = Array.from(document.querySelectorAll('div[data-testid="cellInnerDiv"]'));
+            const targetCell = cells.find(cell => {
+                const hEl = cell.querySelector('a[data-testid="DM_Conversation_Avatar"]') || 
+                            cell.querySelector('a[href^="/"]');
+                if (!hEl) return false;
+                const href = hEl.getAttribute('href');
+                const handle = href.split('/').filter(p => p).shift();
+                return handle === nextHandle;
+            });
+
+            if (!targetCell) {
+                console.warn(`[KXF] Target handle @${nextHandle} not found in current view. Skipping.`);
+                this.processNext();
+                return;
+            }
+
             this.isLocked = true;
             this.currentBatchId = Date.now();
-            this.statusText = "寻找目标...";
+            this.statusText = `正在斩杀 @${nextHandle}...`;
             this.updateUI();
 
-            const container = nextCb.closest('[data-testid="cellInnerDiv"]');
+            const container = targetCell;
             if (container) {
                 // Highlight and scroll
                 document.querySelectorAll('.kxf-processing-highlight').forEach(el => el.classList.remove('kxf-processing-highlight'));
@@ -394,8 +506,8 @@ if (isTopFrame) {
                 // Find the options button and trigger
                 const optBtn = container.querySelector(`button[aria-label="选项菜单"]`);
                 if (optBtn) {
-                    console.log("[KXF] Batch: Starting next kill with ID:", this.currentBatchId);
-                    nextCb.dataset.kxfProcessed = "true";
+                    // Mark this handle as done in the UI persistence
+                    this.selectedHandles.delete(nextHandle);
                     
                     // Trigger the existing click logic
                     sessionStorage.setItem("kxf_auto_report", "true");
@@ -403,13 +515,12 @@ if (isTopFrame) {
                     
                     // Small delay to ensure scroll finished
                     setTimeout(() => {
-                        this.statusText = "触发举报菜单...";
+                        this.statusText = "发现菜单...";
                         this.updateUI();
                         robustClickTop(optBtn);
                     }, 1000);
                 } else {
                     console.warn("[KXF] Could not find options button for item, skipping.");
-                    nextCb.dataset.kxfProcessed = "true";
                     this.isLocked = false;
                     this.processNext();
                 }
@@ -440,7 +551,7 @@ if (isTopFrame) {
                 // Update Progress Data
                 const allChecked = Array.from(document.querySelectorAll('.kxf-checkbox:checked'));
                 const processed = allChecked.filter(cb => cb.dataset.kxfProcessed === "true").length;
-                const total = allChecked.length;
+                const total = this.totalTasks || allChecked.length;
                 const percent = Math.round((processed / total) * 100);
 
                 const countEl = panel.querySelector('.kxf-progress-count');
@@ -464,45 +575,64 @@ if (isTopFrame) {
         const cells = document.querySelectorAll('div[data-testid="cellInnerDiv"]');
         cells.forEach(cell => {
             const conv = cell.querySelector('div[data-testid="conversation"]');
-            if (!conv || cell.querySelector('.kxf-cb-container')) return;
+            if (!conv) return;
 
-            // CRITICAL: Do NOT set cell.style.position = 'relative'. 
-            // X uses absolute positioning for its virtual scroll. Overriding it breaks row heights.
+            // Extract the handle for this row
+            const handleEl = cell.querySelector('a[data-testid="DM_Conversation_Avatar"]') || 
+                             cell.querySelector('a[href^="/"]');
+            if (!handleEl) return;
+            const href = handleEl.getAttribute('href');
+            const handle = href.split('/').filter(p => p).shift();
+            if (!handle) return;
 
-            const cbContainer = document.createElement('div');
-            cbContainer.className = 'kxf-cb-container';
-            // Use absolute positioning inside the conv container and add padding to make space
-            conv.style.position = 'relative';
-            conv.style.paddingLeft = '42px'; 
-            
-            cbContainer.style.cssText = "position: absolute; left: 10px; top: 50%; transform: translateY(-50%); z-index: 101; display: flex; align-items: center; justify-content: center; width: 20px; height: 20px;";
-            cbContainer.innerHTML = `<input type="checkbox" class="kxf-checkbox" style="width: 20px; height: 20px; cursor: pointer; accent-color: rgb(244,33,46);">`;
-            
-            conv.insertBefore(cbContainer, conv.firstChild);
-            
-            const checkbox = cbContainer.querySelector('input');
-            const stop = (e) => e.stopPropagation();
-            cbContainer.addEventListener('click', stop);
-            cbContainer.addEventListener('mousedown', stop);
-            cbContainer.addEventListener('mouseup', stop);
+            let checkboxContainer = cell.querySelector('.kxf-cb-container');
+            let checkbox;
 
-            checkbox.addEventListener('change', () => {
-                if (checkbox.checked) {
-                    cell.style.backgroundColor = 'rgba(244, 33, 46, 0.1)';
-                    delete checkbox.dataset.kxfProcessed;
-                } else {
-                    cell.style.backgroundColor = '';
-                }
-            });
+            if (!checkboxContainer) {
+                checkboxContainer = document.createElement('div');
+                checkboxContainer.className = 'kxf-cb-container';
+                checkboxContainer.innerHTML = `<input type="checkbox" class="kxf-checkbox" style="width: 20px; height: 20px; cursor: pointer; accent-color: rgb(244,33,46);">`;
+                conv.insertBefore(checkboxContainer, conv.firstChild);
+                
+                checkbox = checkboxContainer.querySelector('input');
+                const stop = (e) => e.stopPropagation();
+                checkboxContainer.addEventListener('click', stop);
+                checkboxContainer.addEventListener('mousedown', stop);
+                checkboxContainer.addEventListener('mouseup', stop);
+
+                checkbox.addEventListener('change', () => {
+                    if (checkbox.checked) {
+                        window.BatchRunner.selectedHandles.add(handle);
+                        cell.style.backgroundColor = 'rgba(244, 33, 46, 0.1)';
+                    } else {
+                        window.BatchRunner.selectedHandles.delete(handle);
+                        cell.style.backgroundColor = '';
+                    }
+                    if (window.BatchRunner.state === 'IDLE') {
+                        window.BatchRunner.updateUI();
+                    }
+                });
+            } else {
+                checkbox = checkboxContainer.querySelector('input');
+            }
+
+            // Sync visual state with memory
+            const isSelected = window.BatchRunner.selectedHandles.has(handle);
+            if (checkbox.checked !== isSelected) {
+                checkbox.checked = isSelected;
+                cell.style.backgroundColor = isSelected ? 'rgba(244, 33, 46, 0.1)' : '';
+            }
         });
     }
     
-    // Fallback: X's React is aggressive, re-check every second on request page
-    setInterval(() => {
-        if (window.location.href.includes('/requests')) {
-            injectCheckboxes();
+    // Fallback: X's React is aggressive, re-check occasionally
+    const mainInterval = setInterval(() => {
+        if (!chrome.runtime?.id) {
+            clearInterval(mainInterval);
+            return;
         }
-    }, 1000);
+        applySettings();
+    }, 2000);
 
     function injectBatchPanel() {
         if (document.getElementById('kxf-batch-panel')) return;
@@ -531,15 +661,31 @@ if (isTopFrame) {
         document.body.appendChild(panel);
 
         panel.querySelector('.kxf-select-all-btn').addEventListener('click', () => {
-            const boxes = document.querySelectorAll('.kxf-checkbox');
-            const anyUnchecked = Array.from(boxes).some(b => !b.checked);
-            boxes.forEach(b => {
-                b.checked = anyUnchecked;
-                delete b.dataset.kxfProcessed;
-                // Trigger visual update
-                const container = b.closest('[data-testid="cellInnerDiv"]');
-                if (container) container.style.backgroundColor = b.checked ? 'rgba(244, 33, 46, 0.1)' : '';
+            const cells = document.querySelectorAll('div[data-testid="cellInnerDiv"]');
+            const visibleHandles = [];
+            cells.forEach(cell => {
+                const hEl = cell.querySelector('a[data-testid="DM_Conversation_Avatar"]') || 
+                            cell.querySelector('a[href^="/"]');
+                if (hEl) {
+                    const href = hEl.getAttribute('href');
+                    const handle = href.split('/').filter(p => p).shift();
+                    if (handle) visibleHandles.push(handle);
+                }
             });
+
+            const allVisibleSelected = visibleHandles.every(h => window.BatchRunner.selectedHandles.has(h));
+            
+            if (allVisibleSelected) {
+                // Deselect all visible
+                visibleHandles.forEach(h => window.BatchRunner.selectedHandles.delete(h));
+            } else {
+                // Select all visible
+                visibleHandles.forEach(h => window.BatchRunner.selectedHandles.add(h));
+            }
+            
+            // Sync UI
+            injectCheckboxes();
+            window.BatchRunner.updateUI();
         });
 
         panel.querySelector('.kxf-btn-start').addEventListener('click', () => window.BatchRunner.start());
@@ -557,6 +703,18 @@ if (isTopFrame) {
         if (panel) panel.remove();
     }
 
+    function removeCheckboxes() {
+        // 1. Remove the checkbox containers
+        document.querySelectorAll('.kxf-cb-container').forEach(el => el.remove());
+        
+        // 2. Reset cell background colors
+        document.querySelectorAll('div[data-testid="cellInnerDiv"]').forEach(cell => {
+            if (cell.style.backgroundColor.includes('rgba(244, 33, 46, 0.1)')) {
+                cell.style.backgroundColor = '';
+            }
+        });
+    }
+
 } else {
     // --- IFRAME CONTEXT (`https://x.com/i/safety/report_story`) ---
     
@@ -565,6 +723,7 @@ if (isTopFrame) {
         
         let autoReportArmed = false;
         let currentBatchId = null;
+        window.kxfDoneSent = false;
 
         // Trust parent window's answer if we get one
         window.addEventListener("message", (event) => {
@@ -644,13 +803,24 @@ if (isTopFrame) {
             }
 
             // 4. Check for Success Step (if blockers are gone)
-            // If we are armed but none of the buttons exist, check if we are on the success screen
-            const text = document.body.innerText || "";
-            if (text.includes("感谢") || text.includes("完成") || text.includes("Thanks")) {
-                console.log("[KXF Iframe] Detected Success Screen in Iframe. Signaling parent...");
-                try {
-                    window.parent.postMessage({ type: "KXF_KILL_DONE" }, "*");
-                } catch(e) {}
+            const isBlockVisible = !!(document.querySelector('#block-btn') || document.querySelector('button[value="block"]'));
+            const isSpamVisible = !!(document.querySelector('#spam-btn') || document.querySelector('button[value="SpamOption"]'));
+            const isSubmitVisible = !!(document.querySelector('.submit-btn'));
+
+            if (!isBlockVisible && !isSpamVisible && !isSubmitVisible) {
+                const text = document.body.innerText || "";
+                if (text.includes("感谢") || text.includes("完成") || text.includes("Thanks")) {
+                    if (window.kxfDoneSent) return;
+                    
+                    window.kxfDoneSent = true;
+                    console.log("[KXF Iframe] Detected Success Screen in Iframe. Signaling parent...");
+                    try {
+                        window.parent.postMessage({ 
+                            type: "KXF_KILL_DONE", 
+                            batchId: currentBatchId 
+                        }, "*");
+                    } catch(e) {}
+                }
             }
         }
 

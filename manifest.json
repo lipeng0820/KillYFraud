@@ -8,15 +8,16 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": ["*://*.x.com/*", "*://*.twitter.com/*"],
   "action": {
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
-    }
+    },
+    "default_popup": "popup.html"
   },
-  "permissions": ["activeTab"],
-  "host_permissions": ["*://*.x.com/*", "*://*.twitter.com/*"],
   "content_scripts": [
     {
       "matches": ["*://*.x.com/*", "*://*.twitter.com/*"],

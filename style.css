@@ -141,11 +141,16 @@
 }
 /* --- Batch Processing UI --- */
 .kxf-cb-container {
-    padding: 0 12px;
+    position: absolute;
+    left: 4px;
+    top: 50%;
+    transform: translateY(-50%);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 10;
+    width: 30px;
+    height: 30px;
+    z-index: 101;
 }
 
 .kxf-checkbox {
@@ -219,3 +224,9 @@
     border: 1px solid #1d9bf0;
 }
 .kxf-select-all-btn:hover { background: rgba(29, 155, 240, 0.1); }
+
+/* --- 强制布局恢复：使用 CSS 类控制而非 JS 内联样式 --- */
+body.kxf-batch-mode div[data-testid="conversation"] {
+    position: relative !important;
+    padding-left: 42px !important;
+}
