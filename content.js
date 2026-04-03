@@ -74,18 +74,24 @@ if (isTopFrame) {
 
     // Listen for setting changes from popup
     chrome.storage.onChanged.addListener((changes) => {
+        if (!chrome.runtime?.id) return;
+        
         if (changes.enabled || changes.batchEnabled) {
             console.log("[KXF] Settings changed, applying...");
-            applySettings();
+            applySettings().catch(() => {});
         }
     });
 
     // Initial apply
-    applySettings();
+    applySettings().catch(() => {});
 
     // MutationObserver to watch DOM for changes
     const topObserver = new MutationObserver(async (mutations) => {
-        applySettings();
+        if (!chrome.runtime?.id) {
+            topObserver.disconnect();
+            return;
+        }
+        applySettings().catch(() => {});
         
         // Also watch for Report menu when auto-report is active
         if (sessionStorage.getItem("kxf_auto_report") === "true") {
@@ -340,6 +346,7 @@ if (isTopFrame) {
                 banLogs: newLogs 
             });
         } catch (e) {
+            if (e.message?.includes('context invalidated')) return;
             console.error("[KXF] recordBan error:", e);
         }
     }
@@ -631,7 +638,7 @@ if (isTopFrame) {
             clearInterval(mainInterval);
             return;
         }
-        applySettings();
+        applySettings().catch(() => {});
     }, 2000);
 
     function injectBatchPanel() {
