@@ -3,7 +3,8 @@ const isTopFrame = window.top === window.self;
 if (isTopFrame) {
     console.log("🚀 [X 垃圾私信斩杀器] 已在主框架启动");
     console.log("[KXF] Top Frame Initialized.");
-    window.lastProcessedBatchId = null;
+    window.lastProcessedKillId = null;
+    window.currentKillId = null;
     
     // --- 1. Quick Jump Button ---
     const JUMP_URL = "https://x.com/messages/requests";
@@ -30,6 +31,10 @@ if (isTopFrame) {
         });
         
         document.body.appendChild(btn);
+    }
+
+    function createKillId(source = 'kill') {
+        return `${source}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     }
     
     // --- 1. Settings & UI Management ---
@@ -128,6 +133,7 @@ if (isTopFrame) {
 
         if (path && path.getAttribute('d') === TARGET_SVG_PATH) {
             console.log("[KXF] Delete icon clicked. Arming Auto-Report!");
+            window.currentKillId = createKillId('single');
             sessionStorage.setItem("kxf_auto_report", "true");
             
             // Extract handle for logging
@@ -159,13 +165,16 @@ if (isTopFrame) {
         } else if (event.data.type === "KXF_KILL_DONE") {
             console.log("[KXF] Action complete inside iframe. Cleaning up...");
             
-            // Deduplicate: Don't process the same batch item twice
-            const msgBatchId = event.data.batchId || (window.BatchRunner ? window.BatchRunner.currentBatchId : null);
-            if (msgBatchId && window.lastProcessedBatchId === msgBatchId) {
-                console.log("[KXF] Already processed this batch item. Ignoring duplicate.");
+            // Deduplicate by the kill session ID so single mode and batch mode are both protected.
+            const msgKillId = event.data.killId ||
+                              event.data.batchId ||
+                              window.currentKillId ||
+                              (window.BatchRunner ? window.BatchRunner.currentBatchId : null);
+            if (msgKillId && window.lastProcessedKillId === msgKillId) {
+                console.log("[KXF] Already processed this kill session. Ignoring duplicate.");
                 return;
             }
-            window.lastProcessedBatchId = msgBatchId;
+            window.lastProcessedKillId = msgKillId;
 
             // Force hide and remove all report iframes
             const iframes = document.querySelectorAll('iframe[src*="report_story"]');
@@ -183,11 +192,13 @@ if (isTopFrame) {
         } else if (event.data.type === "KXF_IS_ARMED_QUERY") {
             const isArmed = sessionStorage.getItem("kxf_auto_report") === "true";
             const batchId = window.BatchRunner ? window.BatchRunner.currentBatchId : null;
+            const killId = window.currentKillId || batchId;
             if (event.source) {
                 event.source.postMessage({ 
                     type: "KXF_IS_ARMED_RESPONSE", 
                     armed: isArmed,
-                    batchId: batchId 
+                    batchId: batchId,
+                    killId: killId
                 }, "*");
             }
         }
@@ -203,6 +214,7 @@ if (isTopFrame) {
             if (attempts > 60) { // Give up after ~15-20 seconds
                 console.log("[KXF] Modal closure timeout. Giving up.");
                 sessionStorage.removeItem("kxf_auto_report");
+                window.currentKillId = null;
                 return;
             }
             
@@ -257,6 +269,7 @@ if (isTopFrame) {
                 } else {
                     console.log("[KXF] Success: Modal is gone.");
                     sessionStorage.removeItem("kxf_auto_report");
+                    window.currentKillId = null;
                     
                     // If batching, move to next after cooling down
                     if (window.BatchRunner && window.BatchRunner.state === 'RUNNING') {
@@ -382,7 +395,8 @@ if (isTopFrame) {
             iframes.forEach(iframe => {
                 iframe.contentWindow.postMessage({ 
                     type: "KXF_DO_KILL",
-                    batchId: window.BatchRunner ? window.BatchRunner.currentBatchId : null
+                    batchId: window.BatchRunner ? window.BatchRunner.currentBatchId : null,
+                    killId: window.currentKillId || (window.BatchRunner ? window.BatchRunner.currentBatchId : null)
                 }, "*");
             });
             setTimeout(() => {
@@ -458,8 +472,10 @@ if (isTopFrame) {
             this.state = 'IDLE';
             this.isLocked = false;
             this.currentBatchId = null;
+            this.currentTargetHandle = null;
             this.taskQueue = [];
             this.selectedHandles.clear();
+            window.currentKillId = null;
             this.updateUI();
             
             // Clear all checkboxes in DOM
@@ -499,7 +515,8 @@ if (isTopFrame) {
             }
 
             this.isLocked = true;
-            this.currentBatchId = Date.now();
+            this.currentBatchId = createKillId('batch');
+            window.currentKillId = this.currentBatchId;
             this.statusText = `正在斩杀 @${nextHandle}...`;
             this.updateUI();
 
@@ -730,6 +747,7 @@ if (isTopFrame) {
         
         let autoReportArmed = false;
         let currentBatchId = null;
+        let currentKillId = null;
         window.kxfDoneSent = false;
 
         // Trust parent window's answer if we get one
@@ -737,18 +755,27 @@ if (isTopFrame) {
             if (event.data && event.data.type === "KXF_IS_ARMED_RESPONSE") {
                 autoReportArmed = event.data.armed;
                 currentBatchId = event.data.batchId;
-                console.log("[KXF Iframe] Armed Status from Parent:", autoReportArmed, "Batch ID:", currentBatchId);
+                currentKillId = event.data.killId || currentKillId;
+                console.log("[KXF Iframe] Armed Status from Parent:", autoReportArmed, "Batch ID:", currentBatchId, "Kill ID:", currentKillId);
                 if (autoReportArmed) {
                     processIframeFlow(); // Trigger immediately!
                 }
             } else if (event.data && event.data.type === "KXF_DO_KILL") {
                 const blockBtn = document.querySelector('#block-btn') || document.querySelector('button[value="block"]');
+                currentKillId = event.data.killId || currentKillId;
                 if (blockBtn) {
                     console.log("[KXF Iframe] Kill Order received. Blocking!");
                     robustClick(blockBtn);
                     
-                    // Send message immediately with Batch ID
-                    window.parent.postMessage({ type: "KXF_KILL_DONE", batchId: event.data.batchId || currentBatchId }, "*");
+                    if (!window.kxfDoneSent) {
+                        window.kxfDoneSent = true;
+                        // Notify parent immediately so it can close the modal without waiting for another DOM mutation.
+                        window.parent.postMessage({ 
+                            type: "KXF_KILL_DONE",
+                            batchId: event.data.batchId || currentBatchId,
+                            killId: currentKillId || event.data.batchId || currentBatchId
+                        }, "*");
+                    }
                 }
             }
         });
@@ -824,7 +851,8 @@ if (isTopFrame) {
                     try {
                         window.parent.postMessage({ 
                             type: "KXF_KILL_DONE", 
-                            batchId: currentBatchId 
+                            batchId: currentBatchId,
+                            killId: currentKillId || currentBatchId
                         }, "*");
                     } catch(e) {}
                 }
